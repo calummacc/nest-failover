@@ -90,6 +90,30 @@ import { MailProviderA, MailProviderB } from './mail.providers';
 export class AppModule {}
 ```
 
+Or configure from other modules/env using `forRootAsync`:
+
+```ts
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { FallbackCoreModule, FallbackCoreOptions } from '@calumma/nest-failover';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot(),
+    FallbackCoreModule.forRootAsync<SendMailInput, SendMailResult>({
+      inject: [ConfigService],
+      useFactory: async (cfg: ConfigService): Promise<FallbackCoreOptions<SendMailInput, SendMailResult>> => ({
+        providers: [
+          { provider: new MailProviderA(/* cfg */), maxRetry: 2, retryDelayMs: 200 },
+          { provider: new MailProviderB(/* cfg */) },
+        ],
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
 3) Inject and use in a service/controller
 
 ```ts
@@ -192,12 +216,19 @@ Exports from `@calumma/nest-failover`:
 
 - `FallbackCoreModule`
   - `forRoot<TInput, TResult>(options: FallbackCoreOptions<TInput, TResult>): DynamicModule`
+  - `forRootAsync<TInput, TResult>(options: FallbackCoreModuleAsyncOptions<TInput, TResult>): DynamicModule`
 
 - `FallbackCoreService<TInput, TResult>`
   - `execute(input: TInput): Promise<TResult>`
   - `executeAll(input: TInput, providerNames?: string[]): Promise<Array<{ provider: string; result?: TResult; error?: any }>>`
   - `executeAny(input: TInput, providerNames?: string[]): Promise<TResult>`
   - `executeWithFilter(input: TInput, providerNames: string[], mode?: 'parallel' | 'sequential')`
+- `FALLBACK_CORE_OPTIONS` (Injection token for module options)
+- `FallbackCoreModuleAsyncOptions<TInput, TResult>` (async factory options)
+
+- `AllProvidersFailedError`
+  - Thrown by `executeAny` when all selected providers fail, with `errors: unknown[]`
+
 
 - `IProvider<TInput, TResult>`
   - `name?: string`
@@ -251,6 +282,138 @@ Tips:
   - `onProviderFail` is called for every failed attempt.
   - `onAllFailed` is called once when no provider succeeded.
 - The service uses NestJS `Logger` with `debug`, `warn`, and `error`. Ensure your Nest logger level includes `debug` if you want detailed traces.
+- In `executeAny`, when all selected providers fail, the promise rejects with `AllProvidersFailedError` containing all individual errors.
+
+### Multi use‑cases in one app (mail + upload) — 4 approaches
+
+You can use this package for multiple capabilities simultaneously (mail, upload, webhook, etc.). Each capability should have its own provider chain and types. Below are 4 practical approaches.
+
+1) Two independent module imports (simple setup)
+
+```ts
+import { Module } from '@nestjs/common';
+import { FallbackCoreModule } from '@calumma/nest-failover';
+
+@Module({
+  imports: [
+    FallbackCoreModule.forRoot<SendMailInput, SendMailResult>({
+      providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
+    }),
+    FallbackCoreModule.forRoot<UploadInput, UploadResult>({
+      providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Note: This registers the same `FallbackCoreService` token twice. If both are used in the same scope, prefer approach (2), (3), or (4) to avoid ambiguity.
+
+2) Custom provider tokens (recommended)
+
+```ts
+// tokens.ts
+export const MAIL_FAILOVER = 'MAIL_FAILOVER';
+export const UPLOAD_FAILOVER = 'UPLOAD_FAILOVER';
+```
+
+```ts
+import { Module } from '@nestjs/common';
+import { FallbackCoreService } from '@calumma/nest-failover';
+import { MAIL_FAILOVER, UPLOAD_FAILOVER } from './tokens';
+
+@Module({
+  providers: [
+    {
+      provide: MAIL_FAILOVER,
+      useFactory: () => new FallbackCoreService<SendMailInput, SendMailResult>({
+        providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
+      }),
+    },
+    {
+      provide: UPLOAD_FAILOVER,
+      useFactory: () => new FallbackCoreService<UploadInput, UploadResult>({
+        providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }],
+      }),
+    },
+  ],
+  exports: [MAIL_FAILOVER, UPLOAD_FAILOVER],
+})
+export class AppModule {}
+```
+
+Inject by token:
+
+```ts
+import { Inject, Injectable } from '@nestjs/common';
+import { FallbackCoreService } from '@calumma/nest-failover';
+import { MAIL_FAILOVER, UPLOAD_FAILOVER } from './tokens';
+
+@Injectable()
+export class MailService {
+  constructor(
+    @Inject(MAIL_FAILOVER)
+    private readonly mailFailover: FallbackCoreService<SendMailInput, SendMailResult>,
+  ) {}
+}
+
+@Injectable()
+export class StorageService {
+  constructor(
+    @Inject(UPLOAD_FAILOVER)
+    private readonly uploadFailover: FallbackCoreService<UploadInput, UploadResult>,
+  ) {}
+}
+```
+
+3) Feature dynamic modules per capability
+
+Create dedicated `MailFailoverModule` and `StorageFailoverModule` that each exports a token (or the service) with its own config.
+
+```ts
+// mail-failover.module.ts
+import { Module } from '@nestjs/common';
+import { MAIL_FAILOVER } from './tokens';
+import { FallbackCoreService } from '@calumma/nest-failover';
+
+@Module({
+  providers: [
+    {
+      provide: MAIL_FAILOVER,
+      useFactory: () => new FallbackCoreService<SendMailInput, SendMailResult>({
+        providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
+      }),
+    },
+  ],
+  exports: [MAIL_FAILOVER],
+})
+export class MailFailoverModule {}
+```
+
+Then import the feature modules where needed and inject by token.
+
+4) Wrapper classes (simple and explicit)
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { FallbackCoreService } from '@calumma/nest-failover';
+
+@Injectable()
+export class MailFailoverService extends FallbackCoreService<SendMailInput, SendMailResult> {
+  constructor() {
+    super({ providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }] });
+  }
+}
+
+@Injectable()
+export class UploadFailoverService extends FallbackCoreService<UploadInput, UploadResult> {
+  constructor() {
+    super({ providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }] });
+  }
+}
+```
+
+Inject these wrapper services directly where needed.
 
 ### How the fallback/priority pattern works
 
