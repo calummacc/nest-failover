@@ -1,0 +1,35 @@
+{
+  "name": "@calumma/nest-failover",
+  "version": "1.0.0",
+  "description": "Generic multi-provider orchestrator for NestJS with priority, fallback, parallel, and retries.",
+  "repository": "https://github.com/calummacc/nest-failover.git",
+  "author": "Hung Nguyen <360anime.suki@gmail.com>",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@nestjs/common": ">=9 <12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "rimraf": "^5.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.0.0"
+  }
+}
