@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   # Ensure only one publish runs at a time for this workflow to avoid double-publish
