@@ -154,6 +154,49 @@ export class MailService {
 
 Provider selection uses `provider.name` (if set) or the class constructor name. Keep names unique if you want to filter precisely.
 
+#### Sequential (fallback) — detailed usage
+
+```ts
+// Injected service: FallbackCoreService<SendMailInput, SendMailResult>
+// This example demonstrates sequential fallback with retries and hooks.
+async function sendWithFallback(fallback: FallbackCoreService<SendMailInput, SendMailResult>) {
+  try {
+    // Will try providers in order: A then B, applying per‑provider retries
+    const result = await fallback.execute({ to: 'user@example.com', subject: 'Welcome' });
+    // result is the first successful provider's result
+    return result;
+  } catch (lastError) {
+    // When all providers fail, execute throws the last encountered error
+    // You can log, transform, or rethrow as appropriate for your domain
+    throw lastError;
+  }
+}
+```
+
+Notes:
+- The array order in `providers` defines the sequential priority. The service attempts each provider until one succeeds.
+- For each provider, the service performs `1 + maxRetry` attempts, waiting `retryDelayMs` between attempts when configured.
+- Hooks are invoked per attempt for failures and once on success for the winning provider:
+  - `onProviderFail(name, input, error)` — called on every failed attempt
+  - `onProviderSuccess(name, input, output)` — called once for the successful attempt
+  - `onAllFailed(input, lastError)` — called once after all providers have been exhausted
+
+Sequential subset with filtering:
+
+```ts
+// Only run a specific subset sequentially and know which provider won
+const { provider, result } = await mailFallback.executeWithFilter(
+  { to: 'user@example.com', subject: 'Digest' },
+  ['mailB', 'mailA'], // order matters; tries 'mailB' first, then 'mailA'
+  'sequential',
+);
+```
+
+Error behavior:
+- `execute` (sequential) throws the last error observed if all providers fail.
+- `executeWithFilter(..., 'sequential')` behaves the same for the filtered subset.
+- If you need all individual errors, use `executeAll` (never throws) or `executeAny` (rejects with aggregated errors when all fail).
+
 ### Real‑world examples
 
 #### Send mail with fallback
