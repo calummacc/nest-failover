@@ -1,6 +1,6 @@
 {
   "name": "@calumma/nest-failover",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Generic multi-provider orchestrator for NestJS with priority, fallback, parallel, and retries.",
   "repository": "https://github.com/calummacc/nest-failover.git",
   "author": "Hung Nguyen <360anime.suki@gmail.com>",
