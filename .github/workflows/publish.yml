@@ -1,0 +1,67 @@
+name: Publish to npm
+
+# This workflow builds the package and publishes it to npm when you create a GitHub Release
+# or push a tag like v1.2.3. It also supports manual runs via "Run workflow".
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Ensure only one publish runs at a time for this workflow to avoid double-publish
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        # Node 20 comes with npm 10 which supports provenance
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Verify tag matches package.json version
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "package.json version: v${PKG_VERSION}"
+          echo "ref name: ${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_NAME:-}" != "v${PKG_VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version v${PKG_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Build package
+        run: yarn build
+
+      - name: Publish to npm
+        # IMPORTANT:
+        # - Provide an npm Automation token in repo secrets as NPM_TOKEN
+        # - For public scoped packages, first publish must specify --access public (we also set publishConfig in package.json)
+        # - --provenance enables supply chain provenance when publishing from GitHub Actions
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
+        run: |
+          # If this version is already published, npm will error. That's expected.
+          npm publish --access public --provenance
+
+

@@ -18,15 +18,20 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "clean": "rimraf dist",
-    "build": "npm run clean && tsc -p tsconfig.json",
-    "prepare": "npm run build"
+    "build": "yarn run clean && tsc -p tsconfig.json",
+    "prepare": "yarn run build"
   },
   "peerDependencies": {
-    "@nestjs/common": ">=9 <12"
+    "@nestjs/common": "*"
   },
   "devDependencies": {
+    "@nestjs/common": "^11.1.6",
     "@types/node": "^20.0.0",
     "rimraf": "^5.0.0",
     "ts-node": "^10.9.2",
