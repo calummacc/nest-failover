@@ -15,7 +15,7 @@ A tiny, generic NestJS module to orchestrate multiple providers for a single cap
 - **Hooks** for success/failure and when all have failed
 - **NestJS DI** friendly and fully typed at the call site
 
-Also referred to as `@calumma/nest-multi-provider` conceptually.
+Also referred to as `@calumma/nest-failover` conceptually.
 
 Note: This package exports simple interfaces so you can plug in any provider (SDKs, HTTP clients, etc.).
 
