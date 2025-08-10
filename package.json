@@ -1,6 +1,6 @@
 {
   "name": "@calumma/nest-failover",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Generic multi-provider orchestrator for NestJS with priority, fallback, parallel, and retries.",
   "repository": {
     "type": "git",
