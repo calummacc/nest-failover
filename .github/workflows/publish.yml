@@ -78,8 +78,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
         run: |
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
-          npm whoami --registry=https://npm.pkg.github.com | sed 's/.*/Authenticated as: &/'
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "GH_PACKAGES_TOKEN is empty or not configured." >&2
+            exit 1
+          fi
+          {
+            echo "@calumma:registry=https://npm.pkg.github.com";
+            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}";
+            echo "always-auth=true";
+          } >> ~/.npmrc
+          npm whoami --registry=https://npm.pkg.github.com
 
       - name: Publish to GitHub Packages (npm.pkg.github.com)
         # Authenticate with a Personal Access Token (classic) that belongs
