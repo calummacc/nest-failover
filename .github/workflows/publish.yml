@@ -73,6 +73,14 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: '@calumma'
 
+      - name: Authenticate to GitHub Packages
+        # Persist auth to ~/.npmrc to avoid ENEEDAUTH when npm ignores env
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+          npm whoami --registry=https://npm.pkg.github.com | sed 's/.*/Authenticated as: &/'
+
       - name: Publish to GitHub Packages (npm.pkg.github.com)
         # Authenticate with a Personal Access Token (classic) that belongs
         # to an owner with publish rights to the @calumma namespace
