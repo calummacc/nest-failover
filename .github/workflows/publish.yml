@@ -76,25 +76,28 @@ jobs:
       - name: Authenticate to GitHub Packages
         # Persist auth to ~/.npmrc to avoid ENEEDAUTH when npm ignores env
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "GH_PACKAGES_TOKEN is empty or not configured." >&2
+            echo "GITHUB_TOKEN is empty or not configured." >&2
             exit 1
           fi
           {
-            echo "@calumma:registry=https://npm.pkg.github.com";
+            echo "@calummacc:registry=https://npm.pkg.github.com";
             echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}";
             echo "always-auth=true";
           } >> ~/.npmrc
           npm whoami --registry=https://npm.pkg.github.com
 
+      - name: Rewrite package name for GitHub Packages (@calummacc scope)
+        run: |
+          node -e "const fs=require('fs');const pkg=require('./package.json');pkg.name='@calummacc/nest-failover';fs.writeFileSync('package.json',JSON.stringify(pkg,null,2));console.log('package.json name =>',pkg.name);"
+
       - name: Publish to GitHub Packages (npm.pkg.github.com)
-        # Authenticate with a Personal Access Token (classic) that belongs
-        # to an owner with publish rights to the @calumma namespace
+        # Use the repository GITHUB_TOKEN to publish under the @calummacc scope
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # First publish on GitHub Packages defaults to private visibility.
           # Adjust visibility in the package settings if you want it public.
