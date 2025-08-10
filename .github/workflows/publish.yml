@@ -74,9 +74,10 @@ jobs:
           scope: '@calumma'
 
       - name: Publish to GitHub Packages (npm.pkg.github.com)
-        # Uses repository GITHUB_TOKEN; package links to this repo by repository field
+        # Authenticate with a Personal Access Token (classic) that belongs
+        # to an owner with publish rights to the @calumma namespace
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
         run: |
           # First publish on GitHub Packages defaults to private visibility.
           # Adjust visibility in the package settings if you want it public.
