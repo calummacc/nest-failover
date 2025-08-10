@@ -475,4 +475,4 @@ Inject these wrapper services directly where needed.
 
 ### License
 
-MIT © Calumma
+MIT © [Calumma](https://github.com/calummacc)
