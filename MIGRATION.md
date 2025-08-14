@@ -19,6 +19,103 @@ This guide helps you move from the single-operation v1 API to the multi-operatio
 - `FallbackCoreService.executeAll(input, providerNames?)` → `executeAllOp('<op-name>', input, { providerNames })`
 - `executeWithFilter(input, providerNames, mode)` → `executeOp`/`executeAnyOp` with `{ providerNames }`
 
+### Detailed migration: `executeWithFilter` (v1) → v2
+
+v1 signature:
+
+```ts
+// v1
+executeWithFilter(
+  input: Input,
+  providerNames: string[],
+  mode: 'sequential' | 'parallel',
+): Promise<unknown>;
+```
+
+In v2 there is no `mode` parameter. You choose the strategy by calling the corresponding method and pass the same `providerNames` via options:
+
+- sequential failover → `executeOp`
+- parallel-any (first success) → `executeAnyOp`
+- parallel-all (collect outcomes) → `executeAllOp`
+
+Notes on shapes and behavior:
+- v1 `mode: 'sequential'` could return `{ provider, result }`. In v2, `executeOp` returns the successful result directly (`result` only). If you need the winning provider for telemetry, use hooks (see below).
+- v1 `mode: 'parallel'` in many codebases was used either to mean "first to succeed" or "all outcomes". In v2 this is explicit:
+  - first success: `executeAnyOp`
+  - all outcomes: `executeAllOp` (returns an array of `{ provider, ok, value|error }`)
+
+#### Example: sequential subset (v1 → v2)
+
+```ts
+// v1
+await service.executeWithFilter(input, ['s3', 'gcs'], 'sequential');
+
+// v2 (pick your real operation name, e.g., 'upload')
+await service.executeOp('upload', input, { providerNames: ['s3', 'gcs'] });
+```
+
+Return shape difference (v2): you get the operation output only. If you must know the winner, capture it via hooks:
+
+```ts
+// during module setup
+FallbackCoreModule.forRoot<Ops>({
+  providers: [/* ... */],
+  hooks: {
+    onProviderSuccess: ({ provider, op }) => {
+      // record who won (e.g., to a request-scoped logger/metrics)
+    },
+  },
+});
+```
+
+#### Example: parallel-any subset (v1 → v2)
+
+```ts
+// v1 (some projects used 'parallel' to mean first success)
+await service.executeWithFilter(input, ['s3', 'gcs'], 'parallel');
+
+// v2 (first to succeed wins)
+await service.executeAnyOp('upload', input, { providerNames: ['s3', 'gcs'] });
+```
+
+#### Example: parallel-all subset (v1 → v2)
+
+```ts
+// v1 (if you used 'parallel' to collect outcomes and inspect them later)
+// you probably followed up with your own aggregation logic.
+
+// v2
+const results = await service.executeAllOp('upload', input, { providerNames: ['s3', 'gcs'] });
+// results: Array<
+//   | { provider: string; ok: true; value: UploadOut }
+//   | { provider: string; ok: false; error: unknown }
+// >
+```
+
+#### Tip: filtering happens before capability checks
+
+`providerNames` reduces candidates first, then v2 automatically skips providers that don’t implement the requested operation. If you filter to names that are all incompatible with the op, you will hit `AllProvidersFailedError` quickly.
+
+#### Recreating v1 `{ provider, result }` for sequential
+
+v2’s `executeOp` returns only the operation result. If you need the winning provider in the return value (not just via hooks), consider:
+
+- Prefer hooks for telemetry and logs (`onProviderSuccess` includes `{ provider, op, attempt, durationMs }`).
+- Or wrap the call yourself and capture the provider via a request-scoped store updated by `onProviderSuccess`.
+
+If your use case is fine with parallel semantics and you only need the identity, you can use `executeAllOp` and pick the first successful entry by your own priority order (note: this changes execution semantics from sequential to parallel):
+
+```ts
+const order = ['s3', 'gcs'];
+const outcomes = await service.executeAllOp('upload', input, { providerNames: order });
+const firstOk = order
+  .map(name => outcomes.find(o => o.provider === name && o.ok))
+  .find(Boolean) as { provider: string; ok: true; value: UploadOut } | undefined;
+if (!firstOk) throw new Error('All failed');
+const { provider, value: result } = firstOk;
+```
+
+
 ## Providers
 
 ### Option A: Implement `MultiOpProvider`
