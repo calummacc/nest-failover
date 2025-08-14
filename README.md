@@ -1,18 +1,18 @@
-### @calumma/nest-failover — Multi‑provider failover for NestJS
+### @calumma/nest-failover — Multi‑provider failover for NestJS (v2)
 
 [![npm version](https://img.shields.io/npm/v/%40calumma%2Fnest-failover.svg)](https://www.npmjs.com/package/@calumma/nest-failover)
 [![npm downloads](https://img.shields.io/npm/dm/%40calumma%2Fnest-failover.svg)](https://www.npmjs.com/package/@calumma/nest-failover)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![GitHub](https://img.shields.io/badge/github-calummacc%2Fnest--failover-24292e?logo=github&logoColor=white)](https://github.com/calummacc/nest-failover)
 
-A tiny, generic NestJS module to orchestrate multiple providers for a single capability (send mail, upload files, send SMS, …). Configure providers in priority order and the service will:
+Small, generic NestJS module to orchestrate providers for one or more capabilities (mail, storage, SMS, …). In v2, providers can implement multiple operations with type‑safe inputs/outputs. Configure providers in priority order and the service will:
 
 - **Sequential fallback**: try providers one by one until one succeeds
 - **Parallel all**: run all in parallel and get each result
 - **Parallel any**: resolve on the first success (like Promise.any)
 - **Filter by provider**: run only the providers you specify
-- **Retry** per provider with optional delay
-- **Hooks** for success/failure and when all have failed
+- **Retry/backoff** per op and per provider. Strategies: `none`, `linear`, `exp`, `fullJitter`, `equalJitter`, `decorrelatedJitter`, `fibonacci`.
+- **Hooks/telemetry** on success/failure/all failed (with op/attempt/durationMs/provider)
 - **NestJS DI** friendly and fully typed at the call site
 
 Also referred to as `@calumma/nest-failover` conceptually.
@@ -31,7 +31,62 @@ yarn add @calumma/nest-failover
 pnpm add @calumma/nest-failover
 ```
 
-### Quick start (NestJS)
+### Quick start — v2 (Multi‑operation)
+
+```ts
+import { FallbackCoreModule, FallbackCoreService, OpShape, MultiOpProvider } from '@calumma/nest-failover';
+
+type StorageOps = {
+  upload:   OpShape<{ key: string; data: Buffer }, { key: string; url?: string }>;
+  download: OpShape<{ key: string }, { stream: NodeJS.ReadableStream }>;
+  presign:  OpShape<{ key: string; expiresIn?: number }, { url: string }>;
+};
+
+const S3Provider: MultiOpProvider<StorageOps> = {
+  name: 's3',
+  capabilities: {
+    upload: async (input) => ({ key: input.key, url: 'https://s3/upload' }),
+    download: async (input) => ({ stream: {} as any }),
+    presign: async (input) => ({ url: 'https://s3/presign' }),
+  },
+};
+
+@Module({
+  imports: [
+    FallbackCoreModule.forRoot<StorageOps>({
+      providers: [
+        { provider: S3Provider, policy: { maxRetry: 2, retryDelayMs: 200, backoff: 'exp' } },
+        // add more providers (R2, GCS, …)
+      ],
+      policy: {
+        default: { maxRetry: 0 },
+        perOp: { upload: { maxRetry: 1, retryDelayMs: 100 } },
+        perProvider: { s3: { backoff: 'jitteredExp' } },
+      },
+    }),
+  ],
+})
+export class AppModule {}
+
+@Injectable()
+export class StorageService {
+  constructor(private readonly fo: FallbackCoreService<StorageOps>) {}
+
+  async store(key: string, data: Buffer) {
+    return this.fo.executeOp('upload', { key, data });
+  }
+
+  async fetch(key: string) {
+    return this.fo.executeAnyOp('download', { key });
+  }
+
+  async links(key: string) {
+    return this.fo.executeAllOp('presign', { key, expiresIn: 3600 }, { providerNames: ['s3'] });
+  }
+}
+```
+
+### Legacy usage — v1 (single operation)
 
 1) Implement your providers by conforming to `IProvider<TInput, TResult>`
 
@@ -133,7 +188,7 @@ export class MailService {
 }
 ```
 
-### Usage patterns
+### Usage patterns (v1)
 
 - **Sequential (priority + fallback)**: `execute(input)`
   - Tries providers in the configured array order
@@ -197,7 +252,23 @@ Error behavior:
 - `executeWithFilter(..., 'sequential')` behaves the same for the filtered subset.
 - If you need all individual errors, use `executeAll` (never throws) or `executeAny` (rejects with aggregated errors when all fail).
 
-### Real‑world examples
+### Migration to v2
+### Retry policy (v2)
+
+```ts
+type RetryPolicy = {
+  maxRetry?: number;     // default 0
+  baseDelayMs?: number;  // default 200
+  maxDelayMs?: number;   // default 5000
+  backoff?: 'none' | 'linear' | 'exp' | 'fullJitter' | 'equalJitter' | 'decorrelatedJitter' | 'fibonacci'; // default 'fullJitter'
+};
+```
+
+Precedence for effective policy: `perProvider[name] > perOp[op] > entry.policy > policy.default`.
+
+If a provider error exposes `retryAfterMs` or an HTTP `Retry-After` header, the next delay is overridden accordingly.
+
+See `MIGRATION.md` for a concise mapping from v1 to v2 APIs, and how to wrap single‑op providers using `wrapLegacyAsMultiOp`.
 
 #### Send mail with fallback
 

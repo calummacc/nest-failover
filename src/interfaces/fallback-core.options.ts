@@ -49,6 +49,9 @@ export interface ProviderConfig<TInput, TResult> {
  * Use this to declare which providers are available and how the orchestrator should
  * handle lifecycle events such as success, failure, and total failure.
  */
+/**
+ * @deprecated Use v2 options from `src/types.ts` which support multi-operation providers and policies.
+ */
 export interface FallbackCoreOptions<TInput, TResult> {
   /**
    * Providers to be orchestrated, listed in priority order (highest priority first).
