@@ -1,27 +1,78 @@
-### @calumma/nest-failover — Multi‑provider failover for NestJS (v2)
+### @calumma/nest-failover — Multi‑provider failover for NestJS 
 
 [![npm version](https://img.shields.io/npm/v/%40calumma%2Fnest-failover.svg)](https://www.npmjs.com/package/@calumma/nest-failover)
 [![npm downloads](https://img.shields.io/npm/dm/%40calumma%2Fnest-failover.svg)](https://www.npmjs.com/package/@calumma/nest-failover)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![GitHub](https://img.shields.io/badge/github-calummacc%2Fnest--failover-24292e?logo=github&logoColor=white)](https://github.com/calummacc/nest-failover)
 
-Small, generic NestJS module to orchestrate providers for one or more capabilities (mail, storage, SMS, …). In v2, providers can implement multiple operations with type‑safe inputs/outputs. Configure providers in priority order and the service will:
 
-- **Sequential fallback**: try providers one by one until one succeeds
-- **Parallel all**: run all in parallel and get each result
-- **Parallel any**: resolve on the first success (like Promise.any)
-- **Filter by provider**: run only the providers you specify
-- **Retry/backoff** per op and per provider. Strategies: `none`, `linear`, `exp`, `fullJitter`, `equalJitter`, `decorrelatedJitter`, `fibonacci`.
-- **Hooks/telemetry** on success/failure/all failed (with op/attempt/durationMs/provider)
-- **NestJS DI** friendly and fully typed at the call site
+A tiny, type-safe **failover & multi-provider orchestration** module for **NestJS**.  
+With v2, you can define **multi-operation providers** (e.g., `upload`, `download`, `presign`) and call them via:
 
-Also referred to as `@calumma/nest-failover` conceptually.
+- `executeOp` — **sequential** failover by priority
+- `executeAnyOp` — **parallel-any**; returns the first success
+- `executeAllOp` — **parallel-all**; collects all outcomes
 
-Note: This package exports simple interfaces so you can plug in any provider (SDKs, HTTP clients, etc.).
+Includes **retry with backoff** (classic algorithms + jitter), **per-op/per-provider policy**, **provider filtering**, and **observable hooks** for metrics.
 
-### Installation
+> v1 single-operation API remains available but is **deprecated**. See **[Migration from v1](#migration-from-v1)**.
 
-Use your favorite package manager:
+---
+
+## Table of Contents
+
+- [Why this module?](#why-this-module)
+- [Install](#install)
+- [Quick Start (MultiOp)](#quick-start-multiop)
+- [Core Concepts](#core-concepts)
+  - [Operation Shapes](#operation-shapes)
+  - [MultiOpProvider Interface](#multiopprovider-interface)
+  - [FallbackCoreModule Options](#fallbackcoremodule-options)
+  - [Policy Resolution Precedence](#policy-resolution-precedence)
+- [API Reference](#api-reference)
+  - [`executeOp`](#executeop)
+  - [`executeAnyOp`](#executeanyop)
+  - [`executeAllOp`](#executeallop)
+  - [Legacy APIs (Deprecated)](#legacy-apis-deprecated)
+- [Retry & Backoff](#retry--backoff)
+  - [Algorithms](#algorithms)
+  - [Respecting Retry-After](#respecting-retry-after)
+  - [Choosing a Strategy](#choosing-a-strategy)
+- [Hooks & Telemetry](#hooks--telemetry)
+- [Examples](#examples)
+  - [StorageOps: upload, download, presign](#storageops-upload-download-presign)
+  - [Sequential with Priority & Retry](#sequential-with-priority--retry)
+  - [Parallel Any (Fastest Success)](#parallel-any-fastest-success)
+  - [Parallel All (Health Fanout)](#parallel-all-health-fanout)
+  - [Filtering Providers](#filtering-providers)
+- [Migration from v1](#migration-from-v1)
+- [Error Model](#error-model)
+- [Performance Tips](#performance-tips)
+- [Troubleshooting & FAQ](#troubleshooting--faq)
+- [TypeScript Notes](#typescript-notes)
+- [Versioning](#versioning)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Why this module?
+
+When you must call the **same capability** across multiple backends/providers (e.g., S3, R2, GCS), you often want:
+
+- **Failover**: try providers in order until one succeeds
+- **Parallel-any**: return the **first** provider that completes successfully
+- **Parallel-all**: **fan out** to all providers and inspect outcomes
+- **Typed input/output** per operation (not just `any`)
+- **Retry with backoff** and **jitter** to avoid thundering herds
+- **Per-op/per-provider policy** tuning (different SLA/behavior)
+- **Hooks** for logging/metrics
+
+This module gives you these primitives with a tiny surface and solid type-safety.
+
+---
+
+## Install
 
 ```bash
 npm install @calumma/nest-failover
@@ -31,113 +82,113 @@ yarn add @calumma/nest-failover
 pnpm add @calumma/nest-failover
 ```
 
-### Quick start — v2 (Multi‑operation)
+Peer dep: `@nestjs/common` v9+. Works with ESM or CJS TypeScript targets.
+
+### Named Exports
 
 ```ts
-import { FallbackCoreModule, FallbackCoreService, OpShape, MultiOpProvider } from '@calumma/nest-failover';
+import {
+  FallbackCoreModule,
+  FallbackCoreService,
+  OpShape,
+  MultiOpProvider,
+  AllProvidersFailedError,
+  wrapLegacyAsMultiOp,
+  // types
+  RetryPolicy,
+  PolicyConfig,
+} from '@calumma/nest-failover';
+```
 
-type StorageOps = {
+---
+
+## Quick Start (MultiOp)
+
+Define your **operations** and a **provider**:
+
+```ts
+// types.ts
+import { OpShape, MultiOpProvider } from '@calumma/nest-failover';
+
+export type StorageOps = {
   upload:   OpShape<{ key: string; data: Buffer }, { key: string; url?: string }>;
   download: OpShape<{ key: string }, { stream: NodeJS.ReadableStream }>;
   presign:  OpShape<{ key: string; expiresIn?: number }, { url: string }>;
 };
 
-const S3Provider: MultiOpProvider<StorageOps> = {
-  name: 's3',
-  capabilities: {
-    upload: async (input) => ({ key: input.key, url: 'https://s3/upload' }),
-    download: async (input) => ({ stream: {} as any }),
-    presign: async (input) => ({ url: 'https://s3/presign' }),
-  },
-};
+// s3.provider.ts
+export class S3Provider implements MultiOpProvider<StorageOps> {
+  name = 's3';
+  capabilities = {
+    upload:   async (i) => ({ key: i.key, url: await this.putObject(i) }),
+    download: async (i) => ({ stream: await this.getStream(i.key) }),
+    presign:  async (i) => ({ url: await this.signedUrl(i.key, i.expiresIn) }),
+  };
+  // optional per-provider hooks
+  async beforeExecuteOp(op, input) { /* custom logging */ }
+  async afterExecuteOp(op, input, output) { /* metrics */ }
+
+  // ... private methods to talk to S3 SDK ...
+}
+```
+
+### forRootAsync example
+
+```ts
+// app.module.ts
+@Module({
+  imports: [
+    FallbackCoreModule.forRootAsync<StorageOps>({
+      useFactory: async () => {
+        // e.g. load secrets/SDK clients here
+        return {
+          providers: [
+            { provider: new S3Provider(),  policy: { maxRetry: 2, baseDelayMs: 200 } },
+            { provider: new R2Provider(),  policy: { maxRetry: 1 } },
+            { provider: new GCSProvider(), policy: { maxRetry: 1 } },
+          ],
+          policy: {
+            default: { maxRetry: 1, baseDelayMs: 150, maxDelayMs: 5000, backoff: 'fullJitter' },
+            perOp: { upload: { maxRetry: 3 } },
+            perProvider: { r2: { baseDelayMs: 250 } },
+          },
+        };
+      },
+      inject: [], // add ConfigService/etc. if needed
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Wire it into your module:
+
+```ts
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { FallbackCoreModule, OpShape } from '@calumma/nest-failover';
+import { S3Provider } from './s3.provider';
+import { R2Provider } from './r2.provider';
+import { GCSProvider } from './gcs.provider';
+import { StorageOps } from './types';
 
 @Module({
   imports: [
     FallbackCoreModule.forRoot<StorageOps>({
       providers: [
-        { provider: S3Provider, policy: { maxRetry: 2, retryDelayMs: 200, backoff: 'exp' } },
-        // add more providers (R2, GCS, …)
+        { provider: new S3Provider(),  policy: { maxRetry: 2, baseDelayMs: 200 } },
+        { provider: new R2Provider(),  policy: { maxRetry: 1 } },
+        { provider: new GCSProvider(), policy: { maxRetry: 1 } },
       ],
       policy: {
-        default: { maxRetry: 0 },
-        perOp: { upload: { maxRetry: 1, retryDelayMs: 100 } },
-        perProvider: { s3: { backoff: 'jitteredExp' } },
+        default: { maxRetry: 1, baseDelayMs: 150, maxDelayMs: 5000, backoff: 'fullJitter' },
+        perOp: { upload: { maxRetry: 3 } },                 // heavier retry for upload
+        perProvider: { r2: { baseDelayMs: 250 } },          // tune per provider
       },
-    }),
-  ],
-})
-export class AppModule {}
-
-@Injectable()
-export class StorageService {
-  constructor(private readonly fo: FallbackCoreService<StorageOps>) {}
-
-  async store(key: string, data: Buffer) {
-    return this.fo.executeOp('upload', { key, data });
-  }
-
-  async fetch(key: string) {
-    return this.fo.executeAnyOp('download', { key });
-  }
-
-  async links(key: string) {
-    return this.fo.executeAllOp('presign', { key, expiresIn: 3600 }, { providerNames: ['s3'] });
-  }
-}
-```
-
-### Legacy usage — v1 (single operation)
-
-1) Implement your providers by conforming to `IProvider<TInput, TResult>`
-
-```ts
-import { IProvider } from '@calumma/nest-failover';
-
-// Example: a mail provider using Service A
-export class MailProviderA implements IProvider<SendMailInput, SendMailResult> {
-  // Optional: human‑readable name used in filtering and logs
-  name = 'mailA';
-
-  async execute(input: SendMailInput): Promise<SendMailResult> {
-    // Call SDK/HTTP here and return a typed result
-    return { id: 'msg_123', accepted: true };
-  }
-}
-
-// Example: a mail provider using Service B
-export class MailProviderB implements IProvider<SendMailInput, SendMailResult> {
-  name = 'mailB';
-  async execute(input: SendMailInput): Promise<SendMailResult> {
-    return { id: 'msg_456', accepted: true };
-  }
-}
-
-export type SendMailInput = { to: string; subject: string; html?: string; text?: string };
-export type SendMailResult = { id: string; accepted: boolean };
-```
-
-2) Register the module with providers in priority order
-
-```ts
-import { Module } from '@nestjs/common';
-import { FallbackCoreModule } from '@calumma/nest-failover';
-import { MailProviderA, MailProviderB } from './mail.providers';
-
-@Module({
-  imports: [
-    FallbackCoreModule.forRoot<SendMailInput, SendMailResult>({
-      providers: [
-        { provider: new MailProviderA(), maxRetry: 2, retryDelayMs: 200 }, // highest priority
-        { provider: new MailProviderB(), maxRetry: 1 }, // next priority
-      ],
-      onProviderSuccess: (name, input, output) => {
-        // Hook: a provider succeeded
-      },
-      onProviderFail: (name, input, error) => {
-        // Hook: a provider attempt failed
-      },
-      onAllFailed: (input, lastError) => {
-        // Hook: all providers exhausted
+      hooks: {
+        onProviderSuccess: (ctx) => {/* log/metrics */},
+        onProviderFail:    (ctx) => {/* warn/metrics */},
+        onAllFailed:       (ctx) => {/* alert */},
       },
     }),
   ],
@@ -145,405 +196,445 @@ import { MailProviderA, MailProviderB } from './mail.providers';
 export class AppModule {}
 ```
 
-Or configure from other modules/env using `forRootAsync`:
-
-```ts
-import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
-import { FallbackCoreModule, FallbackCoreOptions } from '@calumma/nest-failover';
-
-@Module({
-  imports: [
-    ConfigModule.forRoot(),
-    FallbackCoreModule.forRootAsync<SendMailInput, SendMailResult>({
-      inject: [ConfigService],
-      useFactory: async (cfg: ConfigService): Promise<FallbackCoreOptions<SendMailInput, SendMailResult>> => ({
-        providers: [
-          { provider: new MailProviderA(/* cfg */), maxRetry: 2, retryDelayMs: 200 },
-          { provider: new MailProviderB(/* cfg */) },
-        ],
-      }),
-    }),
-  ],
-})
-export class AppModule {}
-```
-
-3) Inject and use in a service/controller
+Use it in a service:
 
 ```ts
 import { Injectable } from '@nestjs/common';
 import { FallbackCoreService } from '@calumma/nest-failover';
+import { StorageOps } from './types';
 
 @Injectable()
-export class MailService {
-  constructor(
-    private readonly mailFallback: FallbackCoreService<SendMailInput, SendMailResult>,
-  ) {}
+export class FileService {
+  constructor(private readonly failover: FallbackCoreService<StorageOps>) {}
 
-  async sendMail(input: SendMailInput): Promise<SendMailResult> {
-    // Sequential fallback by priority
-    return this.mailFallback.execute(input);
+  async upload(key: string, data: Buffer) {
+    return this.failover.executeOp('upload', { key, data });
+  }
+
+  async presign(key: string) {
+    return this.failover.executeOp('presign', { key, expiresIn: 3600 }, { providerNames: ['s3', 'gcs'] });
   }
 }
 ```
 
-### Usage patterns (v1)
+---
 
-- **Sequential (priority + fallback)**: `execute(input)`
-  - Tries providers in the configured array order
-  - Respects per‑provider `maxRetry` and `retryDelayMs`
-  - Returns the first successful result, or throws the last error if all failed
+## Core Concepts
 
-- **Parallel (get all results)**: `executeAll(input, providerNames?)`
-  - Runs the selected providers in parallel and returns an array with either `result` or `error` for each provider
-  - Signature: `Promise<Array<{ provider: string; result?: TResult; error?: any }>>`
-
-- **Parallel (first success, like Promise.any)**: `executeAny(input, providerNames?)`
-  - Resolves with the first successful result
-  - Rejects with an array of errors when all selected providers fail
-
-- **Filtered execution**: `executeWithFilter(input, providerNames, mode = 'parallel')`
-  - `mode = 'parallel'` returns the same shape as `executeAll`
-  - `mode = 'sequential'` tries providers in the given order and returns `{ provider, result }` or throws on total failure
-
-Provider selection uses `provider.name` (if set) or the class constructor name. Keep names unique if you want to filter precisely.
-
-#### Sequential (fallback) — detailed usage
+### Operation Shapes
 
 ```ts
-// Injected service: FallbackCoreService<SendMailInput, SendMailResult>
-// This example demonstrates sequential fallback with retries and hooks.
-async function sendWithFallback(fallback: FallbackCoreService<SendMailInput, SendMailResult>) {
-  try {
-    // Will try providers in order: A then B, applying per‑provider retries
-    const result = await fallback.execute({ to: 'user@example.com', subject: 'Welcome' });
-    // result is the first successful provider's result
-    return result;
-  } catch (lastError) {
-    // When all providers fail, execute throws the last encountered error
-    // You can log, transform, or rethrow as appropriate for your domain
-    throw lastError;
-  }
+export type OpShape<I = unknown, O = unknown> = { in: I; out: O };
+```
+
+Define a **map** of operation names to `{ in, out }` to get precise typing per operation.
+
+### MultiOpProvider Interface
+
+```ts
+export interface MultiOpProvider<Ops extends Record<string, OpShape>> {
+  name: string;
+  capabilities: {
+    [K in keyof Ops]: (input: Ops[K]['in']) => Promise<Ops[K]['out']>;
+  };
+  beforeExecuteOp?<K extends keyof Ops>(op: K, input: Ops[K]['in']): void | Promise<void>;
+  afterExecuteOp?<K extends keyof Ops>(op: K, input: Ops[K]['in'], output: Ops[K]['out']): void | Promise<void>;
 }
 ```
 
-Notes:
-- The array order in `providers` defines the sequential priority. The service attempts each provider until one succeeds.
-- For each provider, the service performs `1 + maxRetry` attempts, waiting `retryDelayMs` between attempts when configured.
-- Hooks are invoked per attempt for failures and once on success for the winning provider:
-  - `onProviderFail(name, input, error)` — called on every failed attempt
-  - `onProviderSuccess(name, input, output)` — called once for the successful attempt
-  - `onAllFailed(input, lastError)` — called once after all providers have been exhausted
+> Note: Each provider’s `name` must be unique. It’s used for filtering, policy resolution (`perProvider`), logs, and error aggregation. Duplicate names may cause confusing behavior.
 
-Sequential subset with filtering:
+### FallbackCoreModule Options
 
 ```ts
-// Only run a specific subset sequentially and know which provider won
-const { provider, result } = await mailFallback.executeWithFilter(
-  { to: 'user@example.com', subject: 'Digest' },
-  ['mailB', 'mailA'], // order matters; tries 'mailB' first, then 'mailA'
-  'sequential',
-);
-```
+export type BackoffKind =
+  | 'none'
+  | 'linear'
+  | 'exp'
+  | 'fullJitter'
+  | 'equalJitter'
+  | 'decorrelatedJitter'
+  | 'fibonacci';
 
-Error behavior:
-- `execute` (sequential) throws the last error observed if all providers fail.
-- `executeWithFilter(..., 'sequential')` behaves the same for the filtered subset.
-- If you need all individual errors, use `executeAll` (never throws) or `executeAny` (rejects with aggregated errors when all fail).
-
-### Migration to v2
-### Retry policy (v2)
-
-```ts
-type RetryPolicy = {
+export type RetryPolicy = {
   maxRetry?: number;     // default 0
   baseDelayMs?: number;  // default 200
   maxDelayMs?: number;   // default 5000
-  backoff?: 'none' | 'linear' | 'exp' | 'fullJitter' | 'equalJitter' | 'decorrelatedJitter' | 'fibonacci'; // default 'fullJitter'
+  backoff?: BackoffKind; // default 'fullJitter'
+};
+
+export type PolicyConfig<OpNames extends string = string> = {
+  default?: RetryPolicy;
+  perOp?: Partial<Record<OpNames, RetryPolicy>>;
+  perProvider?: Record<string, RetryPolicy>;
+};
+
+export type FallbackCoreOptions<Ops extends Record<string, OpShape> = any> = {
+  providers: Array<
+    | { provider: MultiOpProvider<Ops>; policy?: RetryPolicy }   // v2
+    | { provider: IProvider<any, any>; policy?: RetryPolicy }    // legacy (v1)
+  >;
+  policy?: PolicyConfig<keyof Ops & string>;
+  hooks?: {
+    onProviderSuccess?: (ctx: { provider: string; op?: string; attempt: number; durationMs: number; delayMs?: number }, input: unknown, output: unknown) => void | Promise<void>;
+    onProviderFail?:    (ctx: { provider: string; op?: string; attempt: number; durationMs: number; delayMs?: number }, input: unknown, error: unknown) => void | Promise<void>;
+    onAllFailed?:       (ctx: { op?: string }, input: unknown, errors: ProviderAttemptError[]) => void | Promise<void>;
+  };
 };
 ```
 
-Precedence for effective policy: `perProvider[name] > perOp[op] > entry.policy > policy.default`.
+### Policy Resolution Precedence
 
-If a provider error exposes `retryAfterMs` or an HTTP `Retry-After` header, the next delay is overridden accordingly.
+Effective retry policy is computed with priority:
 
-See `MIGRATION.md` for a concise mapping from v1 to v2 APIs, and how to wrap single‑op providers using `wrapLegacyAsMultiOp`.
-
-#### Send mail with fallback
-
-```ts
-// Try A then B; if both fail, throw the last error
-await this.mailFallback.execute({ to: 'user@example.com', subject: 'Hi there' });
-
-// Run both providers and inspect all outcomes (success and failure)
-const all = await this.mailFallback.executeAll({ to: 'u@example.com', subject: 'Report' });
-// all: [{ provider: 'mailA', result }, { provider: 'mailB', error }]
-
-// Resolve on the first success among the selected providers
-const first = await this.mailFallback.executeAny(
-  { to: 'x@example.com', subject: 'OTP' },
-  ['mailB'], // optional filter
-);
-
-// Only run specific providers, sequentially
-const filteredSequential = await this.mailFallback.executeWithFilter(
-  { to: 'y@example.com', subject: 'Digest' },
-  ['mailB', 'mailA'],
-  'sequential',
-);
-// => { provider: 'mailB', result }
+```
+perProvider[providerName] > perOp[opName] > provider.inlinePolicy > policy.default
 ```
 
-#### Upload files with multiple backends
+Missing fields cascade to lower priority and finally to defaults:
+`maxRetry=0`, `baseDelayMs=200`, `maxDelayMs=5000`, `backoff='fullJitter'`.
+
+---
+
+## API Reference
+
+### `executeOp`
 
 ```ts
-type UploadInput = { buffer: Buffer; key: string };
-type UploadResult = { url: string };
-
-class S3Upload implements IProvider<UploadInput, UploadResult> {
-  name = 's3';
-  async execute(input: UploadInput): Promise<UploadResult> {
-    return { url: `https://s3.example/${input.key}` };
-  }
-}
-
-class GCSUpload implements IProvider<UploadInput, UploadResult> {
-  name = 'gcs';
-  async execute(input: UploadInput): Promise<UploadResult> {
-    return { url: `https://storage.googleapis.com/bucket/${input.key}` };
-  }
-}
-
-// Configure S3 first, then GCS as fallback
-FallbackCoreModule.forRoot<UploadInput, UploadResult>({
-  providers: [
-    { provider: new S3Upload(), maxRetry: 2, retryDelayMs: 150 },
-    { provider: new GCSUpload(), maxRetry: 0 },
-  ],
-});
+executeOp<K extends keyof Ops>(
+  op: K,
+  input: Ops[K]['in'],
+  options?: { providerNames?: string[] }
+): Promise<Ops[K]['out']>;
 ```
 
-### API reference
+* **Sequential**: tries providers in the configured order.
+* Applies per-provider retry with backoff.
+* Skips providers that **don’t implement** `op`.
+* Stops on first success; throws `AllProvidersFailedError` if all failed.
 
-Exports from `@calumma/nest-failover`:
-
-- `FallbackCoreModule`
-  - `forRoot<TInput, TResult>(options: FallbackCoreOptions<TInput, TResult>): DynamicModule`
-  - `forRootAsync<TInput, TResult>(options: FallbackCoreModuleAsyncOptions<TInput, TResult>): DynamicModule`
-
-- `FallbackCoreService<TInput, TResult>`
-  - `execute(input: TInput): Promise<TResult>`
-  - `executeAll(input: TInput, providerNames?: string[]): Promise<Array<{ provider: string; result?: TResult; error?: any }>>`
-  - `executeAny(input: TInput, providerNames?: string[]): Promise<TResult>`
-  - `executeWithFilter(input: TInput, providerNames: string[], mode?: 'parallel' | 'sequential')`
-- `FALLBACK_CORE_OPTIONS` (Injection token for module options)
-- `FallbackCoreModuleAsyncOptions<TInput, TResult>` (async factory options)
-
-- `AllProvidersFailedError`
-  - Thrown by `executeAny` when all selected providers fail, with `errors: unknown[]`
-
-
-- `IProvider<TInput, TResult>`
-  - `name?: string`
-  - `execute(input: TInput): Promise<TResult>`
-
-- `ProviderConfig<TInput, TResult>`
-  - `provider: IProvider<TInput, TResult>`
-  - `maxRetry?: number` — number of retries after the initial attempt (default 0)
-  - `retryDelayMs?: number` — delay between retries in milliseconds (default 0)
-
-- `FallbackCoreOptions<TInput, TResult>`
-  - `providers: Array<ProviderConfig<TInput, TResult>>`
-  - `onProviderSuccess?: (providerName: string, input: TInput, output: TResult) => void`
-  - `onProviderFail?: (providerName: string, input: TInput, error: any) => void`
-  - `onAllFailed?: (input: TInput, lastError: any) => void`
-
-Behavioral notes:
-- `execute` throws the last encountered error when all providers are exhausted.
-- `executeAny` rejects with an array of errors when all selected providers fail.
-- `executeAll` never throws; it returns a mixed array of successes and errors.
-
-### Writing a new provider
-
-1) Implement the interface
+### `executeAnyOp`
 
 ```ts
-import { IProvider } from '@calumma/nest-failover';
+executeAnyOp<K extends keyof Ops>(
+  op: K,
+  input: Ops[K]['in'],
+  options?: { providerNames?: string[] }
+): Promise<Ops[K]['out']>;
+```
 
-export class SmsTwilioProvider implements IProvider<SmsInput, SmsResult> {
-  name = 'twilio';
-  async execute(input: SmsInput): Promise<SmsResult> {
-    // Perform the action and return a typed result
-    return { sid: 'SMxxxxxxxx', accepted: true };
-  }
+* **Parallel-any**: runs all eligible providers concurrently (each with its retry loop).
+* Resolves with the **first** success; rejects with `AllProvidersFailedError` if none succeed.
+
+### `executeAllOp`
+
+```ts
+executeAllOp<K extends keyof Ops>(
+  op: K,
+  input: Ops[K]['in'],
+  options?: { providerNames?: string[] }
+): Promise<Array<
+  { provider: string; ok: true; value: Ops[K]['out'] } |
+  { provider: string; ok: false; error: unknown }
+>>;
+```
+
+* **Parallel-all**: runs all eligible providers concurrently.
+* Returns **all** outcomes (no throw).
+
+### Legacy APIs (Deprecated)
+
+These remain for backward compatibility and internally route via a `'default'` operation using a legacy adapter:
+
+* `execute(input)`
+* `executeAny(input)`
+* `executeAll(input)`
+* `executeWithFilter(input, providerNames, mode)`
+
+Prefer using **`executeOp` / `executeAnyOp` / `executeAllOp`**.
+
+---
+
+## Retry & Backoff
+
+### Algorithms
+
+Supported `backoff` kinds:
+
+| Kind                 | Formula (cap by `maxDelayMs`)      | Notes                                |
+| -------------------- | ---------------------------------- | ------------------------------------ |
+| `none`               | `0`                                | No delay between retries             |
+| `linear`             | `base * attempt`                   | Simple, predictable                  |
+| `exp`                | `base * 2^(attempt-1)`             | Classic exponential                  |
+| `fullJitter`         | `random(0, base * 2^(attempt-1))`  | Recommended default; avoids herds    |
+| `equalJitter`        | `baseExp/2 + random(0, baseExp/2)` | Softer jitter                        |
+| `decorrelatedJitter` | `random(base, prevDelay * 3)`      | Great for flaky networks             |
+| `fibonacci`          | `base * Fib(attempt)`              | Middle ground between linear and exp |
+
+### Respecting Retry-After
+
+If a provider error includes `retryAfterMs` **or** HTTP `Retry-After` header, the next delay **overrides** the computed backoff.
+
+Servers may send `Retry-After` as either seconds or an HTTP-date. This library first tries to parse a number (seconds); if it’s a date, you should convert it to milliseconds and attach as `error.retryAfterMs` on your error before rethrowing.
+
+```ts
+function retryAfterToMs(value: string): number | undefined {
+  const secs = Number(value);
+  if (!Number.isNaN(secs)) return secs * 1000;
+  const asDate = Date.parse(value);
+  if (!Number.isNaN(asDate)) return Math.max(0, asDate - Date.now());
+  return undefined;
 }
 ```
 
-2) Register it in `FallbackCoreModule.forRoot` with optional retry/delay
+### Choosing a Strategy
 
-3) Optionally add more providers and rely on `execute`, `executeAll`, or `executeAny`
-
-Tips:
-- Set a unique `name` for clear filtering and logs.
-- Keep inputs/results small and serializable if you plan to log or persist them.
-- Use provider‑specific retries sparingly if the underlying SDK already retries.
-
-### Error handling and logging
-
-- Hooks allow you to observe lifecycle events:
-  - `onProviderSuccess` is called when a provider resolves successfully.
-  - `onProviderFail` is called for every failed attempt.
-  - `onAllFailed` is called once when no provider succeeded.
-- The service uses NestJS `Logger` with `debug`, `warn`, and `error`. Ensure your Nest logger level includes `debug` if you want detailed traces.
-- In `executeAny`, when all selected providers fail, the promise rejects with `AllProvidersFailedError` containing all individual errors.
-
-### Multi use‑cases in one app (mail + upload) — 4 approaches
-
-You can use this package for multiple capabilities simultaneously (mail, upload, webhook, etc.). Each capability should have its own provider chain and types. Below are 4 practical approaches.
-
-1) Two independent module imports (simple setup)
+* Default: **`fullJitter`** with `baseDelayMs=200`, `maxDelayMs=5000`, `maxRetry=3`.
+* Network-heavy ops (upload/download): `decorrelatedJitter` or `fullJitter`.
+* Lightweight ops (presign/metadata): `linear` with small `maxRetry`.
 
 ```ts
-import { Module } from '@nestjs/common';
-import { FallbackCoreModule } from '@calumma/nest-failover';
-
-@Module({
-  imports: [
-    FallbackCoreModule.forRoot<SendMailInput, SendMailResult>({
-      providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
-    }),
-    FallbackCoreModule.forRoot<UploadInput, UploadResult>({
-      providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }],
-    }),
-  ],
-})
-export class AppModule {}
+// Tune upload heavier than presign, and tweak a specific provider
+policy: {
+  default: { maxRetry: 2, baseDelayMs: 200, maxDelayMs: 5000, backoff: 'fullJitter' },
+  perOp: {
+    upload:  { maxRetry: 4, baseDelayMs: 250, backoff: 'decorrelatedJitter' },
+    presign: { maxRetry: 1, baseDelayMs: 100, backoff: 'linear' },
+  },
+  perProvider: {
+    gcs: { maxRetry: 3, baseDelayMs: 300 }, // overrides above for GCS
+  },
+}
 ```
 
-Note: This registers the same `FallbackCoreService` token twice. If both are used in the same scope, prefer approach (2), (3), or (4) to avoid ambiguity.
+---
 
-2) Custom provider tokens (recommended)
+## Hooks & Telemetry
+
+Global hooks receive context including provider, op, attempt, duration, and `delayMs` (if retrying):
 
 ```ts
-// tokens.ts
-export const MAIL_FAILOVER = 'MAIL_FAILOVER';
-export const UPLOAD_FAILOVER = 'UPLOAD_FAILOVER';
+hooks: {
+  onProviderSuccess: ({ provider, op, attempt, durationMs }) => {},
+  onProviderFail:    ({ provider, op, attempt, durationMs, delayMs }) => {},
+  onAllFailed:       ({ op }, input, attempts) => {},
+}
+```
+
+Use these to export metrics (e.g., Prometheus/OpenTelemetry) or attach structured logs.
+
+---
+
+## Examples
+
+### StorageOps: upload, download, presign
+
+```ts
+export type StorageOps = {
+  upload:   OpShape<{ key: string; data: Buffer }, { key: string; url?: string }>;
+  download: OpShape<{ key: string }, { stream: NodeJS.ReadableStream }>;
+  presign:  OpShape<{ key: string; expiresIn?: number }, { url: string }>;
+};
+```
+
+Three providers implementing different cloud SDKs (`S3Provider`, `R2Provider`, `GCSProvider`) expose the same capabilities.
+
+### Sequential with Priority & Retry
+
+```ts
+const out = await failover.executeOp('upload', { key: 'a.txt', data: buf });
+// Tries S3 -> R2 -> GCS, with per-provider retry and backoff
+```
+
+### Parallel Any (Fastest Success)
+
+```ts
+const stream = await failover.executeAnyOp('download', { key: 'a.txt' });
+// Resolves with the first provider that returns successfully
+```
+
+> Cancellation: When the first provider succeeds, other in-flight attempts are ignored best-effort. Depending on your SDK, you can wire an `AbortController` inside your provider to cancel underlying requests.
+
+```ts
+// Inside a provider method:
+const ac = new AbortController();
+try {
+  const res = await fetch(url, { signal: ac.signal });
+  return await res.json();
+} finally {
+  // expose a cancel hook if your runtime supports it
+}
+```
+
+### Parallel All (Health Fanout)
+
+```ts
+const res = await failover.executeAllOp('presign', { key: 'a.txt', expiresIn: 3600 });
+// Inspect success/failure of every provider
+```
+
+### Filtering Providers
+
+```ts
+await failover.executeOp('presign', { key: 'a.txt' }, { providerNames: ['s3', 'gcs'] });
 ```
 
 ```ts
-import { Module } from '@nestjs/common';
-import { FallbackCoreService } from '@calumma/nest-failover';
-import { MAIL_FAILOVER, UPLOAD_FAILOVER } from './tokens';
-
-@Module({
-  providers: [
-    {
-      provide: MAIL_FAILOVER,
-      useFactory: () => new FallbackCoreService<SendMailInput, SendMailResult>({
-        providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
-      }),
-    },
-    {
-      provide: UPLOAD_FAILOVER,
-      useFactory: () => new FallbackCoreService<UploadInput, UploadResult>({
-        providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }],
-      }),
-    },
-  ],
-  exports: [MAIL_FAILOVER, UPLOAD_FAILOVER],
-})
-export class AppModule {}
+// Without filter; all capable providers are considered automatically
+await failover.executeOp('presign', { key: 'a.txt' });
 ```
 
-Inject by token:
+> Tip: Filtering by `providerNames` narrows candidates before capability checks. If you pass a name that doesn’t implement the `op`, it will be skipped. If all filtered providers are incompatible, you’ll get `AllProvidersFailedError` quickly.
+
+---
+
+## Migration from v1
+
+v1 exposed a single-operation `IProvider<Input, Output>` with methods like `execute`, `executeAny`, `executeAll`.
+
+In v2:
+
+* Prefer **MultiOpProvider** and **`executeOp/AnyOp/AllOp`**.
+* Legacy usage continues to work, but is **deprecated**.
+
+### Adapting a v1 Provider
+
+Wrap a legacy provider to a `'default'` op:
 
 ```ts
-import { Inject, Injectable } from '@nestjs/common';
-import { FallbackCoreService } from '@calumma/nest-failover';
-import { MAIL_FAILOVER, UPLOAD_FAILOVER } from './tokens';
+import { wrapLegacyAsMultiOp } from '@calumma/nest-failover';
 
-@Injectable()
-export class MailService {
+const legacy = { name: 'old', execute: async (input: In): Promise<Out> => {/*...*/} };
+const v2provider = wrapLegacyAsMultiOp(legacy, 'default');
+```
+
+Then call:
+
+```ts
+await failover.executeOp('default' as any, input);
+```
+
+Or convert to a proper MultiOpProvider by defining explicit ops.
+
+```ts
+// If you want type safety without 'as any':
+type LegacyOps = { default: OpShape<In, Out> };
+const wrapped = wrapLegacyAsMultiOp<In, Out>(legacy, 'default');
+// register `wrapped` in FallbackCoreModule.forRoot<LegacyOps>(...)
+await failover.executeOp<'default'>('default', input);
+```
+
+> You can also keep calling `execute`/`executeAny`/`executeAll`; they route through a `'default'` op internally. Prefer `executeOp` for new code.
+
+---
+
+## Error Model
+
+When all providers fail:
+
+```ts
+export class AllProvidersFailedError extends Error {
   constructor(
-    @Inject(MAIL_FAILOVER)
-    private readonly mailFailover: FallbackCoreService<SendMailInput, SendMailResult>,
-  ) {}
+    public readonly op: string | undefined,
+    public readonly attempts: ProviderAttemptError[]
+  ) { super(`All providers failed${op ? ` for op "${op}"` : ''}`); }
 }
 
-@Injectable()
-export class StorageService {
-  constructor(
-    @Inject(UPLOAD_FAILOVER)
-    private readonly uploadFailover: FallbackCoreService<UploadInput, UploadResult>,
-  ) {}
-}
+export type ProviderAttemptError = {
+  provider: string;
+  op?: string;
+  attempt: number;
+  error: unknown;
+};
 ```
 
-3) Feature dynamic modules per capability
+* `executeOp` / `executeAnyOp` throw `AllProvidersFailedError`.
+* `executeAllOp` **never throws**; returns `{ ok: false, error }` entries.
 
-Create dedicated `MailFailoverModule` and `StorageFailoverModule` that each exports a token (or the service) with its own config.
+---
+
+## Performance Tips
+
+* Tune **per-op** and **per-provider** policy: uploads can retry more than presign.
+* Use **parallel-any** for latency-sensitive reads (e.g., nearest region/CDN).
+* Add a lightweight **circuit-breaker** outside (e.g., mark provider unhealthy after repeated failures) if needed.
+* Use hooks to track **p50/p95** and success rates per provider/op.
+
+---
+
+## Testing
+
+Create fake providers that deterministically fail/succeed to validate sequencing and backoff:
 
 ```ts
-// mail-failover.module.ts
-import { Module } from '@nestjs/common';
-import { MAIL_FAILOVER } from './tokens';
-import { FallbackCoreService } from '@calumma/nest-failover';
-
-@Module({
-  providers: [
-    {
-      provide: MAIL_FAILOVER,
-      useFactory: () => new FallbackCoreService<SendMailInput, SendMailResult>({
-        providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }],
-      }),
+class FlakyProvider implements MultiOpProvider<StorageOps> {
+  name = 'flaky';
+  private count = 0;
+  capabilities = {
+    upload: async (i) => {
+      this.count++;
+      if (this.count < 3) throw Object.assign(new Error('ETEMP'), { code: 'ETEMP' });
+      return { key: i.key };
     },
-  ],
-  exports: [MAIL_FAILOVER],
-})
-export class MailFailoverModule {}
-```
-
-Then import the feature modules where needed and inject by token.
-
-4) Wrapper classes (simple and explicit)
-
-```ts
-import { Injectable } from '@nestjs/common';
-import { FallbackCoreService } from '@calumma/nest-failover';
-
-@Injectable()
-export class MailFailoverService extends FallbackCoreService<SendMailInput, SendMailResult> {
-  constructor() {
-    super({ providers: [{ provider: new MailProviderA() }, { provider: new MailProviderB() }] });
-  }
-}
-
-@Injectable()
-export class UploadFailoverService extends FallbackCoreService<UploadInput, UploadResult> {
-  constructor() {
-    super({ providers: [{ provider: new S3Upload() }, { provider: new GCSUpload() }] });
-  }
+    download: async () => { throw new Error('not-impl'); },
+    presign: async () => ({ url: 'https://example.com' }),
+  };
 }
 ```
 
-Inject these wrapper services directly where needed.
+Use `executeOp('upload', ...)` and assert number of attempts/hook calls. For backoff tests, stub timers or inject a time provider.
 
-### How the fallback/priority pattern works
+---
 
-- The array passed to `providers` defines the priority from highest to lowest.
-- `execute` walks this array, attempting each provider and applying per‑provider retries.
-- `executeAny` starts all selected providers without waiting and resolves on the first success.
-- `executeAll` starts all selected providers and aggregates individual outcomes.
-- `executeWithFilter` lets you run a subset (by `name`), either in parallel or sequentially.
+## Troubleshooting & FAQ
 
-### Contributing & extending
+**Q: How do I skip providers that don’t support an operation?**
+A: You don’t need to. The service automatically filters to providers that define the capability for that `op`.
 
-- Issues and PRs are welcome on GitHub: `https://github.com/calummacc/nest-failover`
-- Please include tests and examples where possible.
-- Keep code comments in English and clear.
-- Consider adding example providers (mail, sms, storage) to help others.
+**Q: Can I honor `Retry-After` from HTTP 429/503?**
+A: Yes. If an error includes `retryAfterMs` or an HTTP `Retry-After` header, that delay overrides backoff.
 
-### License
+**Q: How do I run only a subset of providers?**
+A: Use `{ providerNames: [...] }` option.
+
+**Q: Does parallel-any cancel other in-flight providers?**
+A: The first success **wins**; other results are ignored best-effort. Depending on your SDKs, you may optionally cancel requests.
+
+**Q: What Node/Nest versions are supported?**
+A: Node 16+ and NestJS 9+. TypeScript is recommended with `strict` mode.
+
+---
+
+## TypeScript Notes
+
+* Prefer defining ops via `OpShape` map to get precise inference.
+* `executeOp('upload', ...)` infers output type specific to `upload`.
+* For legacy code, consider migration to MultiOpProvider for better types.
+
+---
+
+## Versioning
+
+* v2 introduces MultiOpProvider and per-op APIs.
+* v1 APIs are deprecated but still supported through adapters.
+* See releases for detailed changelogs.
+
+## Environment Support
+
+- Node.js: 16+ (tested on 16/18/20)
+- NestJS: 9+
+- TypeScript: 5+ (`strict` recommended)
+- Module formats: ESM & CJS
+
+---
+
+## Contributing
+
+Issues and PRs are welcome. Please include tests for new features and maintain 100% type coverage in public APIs.
+
+---
+
+## License
 
 MIT © [Calumma](https://github.com/calummacc)
+
